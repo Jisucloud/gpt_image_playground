@@ -6,7 +6,6 @@ export const MAGENTA_KEY_COLOR = '#FF00FF'
 
 export interface TransparentOutputMeta {
   transparentOutput: true
-  transparentKeyColor: typeof GREEN_KEY_COLOR | typeof MAGENTA_KEY_COLOR
   effectivePrompt: string
 }
 
@@ -15,23 +14,16 @@ const KEY_COLOR_RGB = {
   [MAGENTA_KEY_COLOR]: { r: 255, g: 0, b: 255 },
 } as const
 
-const GREEN_SUBJECT_PATTERN =
-  /绿|绿色|青绿|草|树|叶|森林|翡翠|薄荷|green|lime|emerald|mint|grass|leaf|leaves|forest/i
-
 const TRANSPARENT_PROMPT_TEMPLATE = [
-  '透明 PNG 后处理要求：',
-  '生成一个单主体图像，主体完整、轮廓清晰，适合后续抠成透明背景 PNG。',
-  '背景必须是纯色 {keyColor}，铺满整张画布；背景不能有渐变、纹理、阴影、反光、地面、环境、道具或图案。',
-  '不要把背景色用于主体、主体描边、光晕、阴影、反射、高光或任何前景细节。',
-  '主体边缘要干净，主体与纯色背景之间保持明确分离。',
+  '[背景指令]',
+  '背景色选择规则：如果主体包含绿色系（绿、青绿、黄绿、草绿等）颜色，使用纯洋红色(#FF00FF)背景；否则一律使用纯绿色(#00FF00)背景。',
+  '背景要求：整张画布仅由所选纯色填充，无任何渐变、纹理、阴影、光照变化、地面或环境元素。',
+  '主体要求：单主体、完整呈现、轮廓清晰锐利。主体与背景之间保持干净的边缘分离，不要有颜色溢出或混合。',
+  '禁止：主体本身、描边、光晕、投影或反射中不能出现所选背景色。',
 ].join('\n')
 
-export function pickTransparentKeyColor(prompt: string) {
-  return GREEN_SUBJECT_PATTERN.test(prompt) ? MAGENTA_KEY_COLOR : GREEN_KEY_COLOR
-}
-
-export function buildTransparentPrompt(prompt: string, keyColor: string) {
-  return `${prompt.trim()}\n\n${TRANSPARENT_PROMPT_TEMPLATE.replace(/\{keyColor\}/g, keyColor)}`
+export function buildTransparentPrompt(prompt: string) {
+  return `${prompt.trim()}\n\n${TRANSPARENT_PROMPT_TEMPLATE}`
 }
 
 export function getTransparentRequestParams(params: TaskParams): TaskParams {
@@ -44,27 +36,59 @@ export function getTransparentRequestParams(params: TaskParams): TaskParams {
 }
 
 export function createTransparentOutputMeta(prompt: string): TransparentOutputMeta {
-  const transparentKeyColor = pickTransparentKeyColor(prompt)
   return {
     transparentOutput: true,
-    transparentKeyColor,
-    effectivePrompt: buildTransparentPrompt(prompt, transparentKeyColor),
+    effectivePrompt: buildTransparentPrompt(prompt),
   }
 }
 
-export async function removeKeyedBackgroundFromDataUrl(dataUrl: string, keyColor: string): Promise<string> {
+export async function removeKeyedBackgroundFromDataUrl(dataUrl: string, keyColor?: string): Promise<string> {
   const image = await loadImage(dataUrl)
   const canvas = document.createElement('canvas')
   canvas.width = image.naturalWidth
   canvas.height = image.naturalHeight
   const ctx = canvas.getContext('2d', { willReadFrequently: true })
-  if (!ctx) throw new Error('当前浏览器不支持 Canvas，无法执行透明 PNG 后处理')
+  if (!ctx) throw new Error('当前浏览器不支持 Canvas，无法执行透明背景后处理')
 
   ctx.drawImage(image, 0, 0)
   const pixels = ctx.getImageData(0, 0, canvas.width, canvas.height)
-  removeKeyedBackgroundFromPixels(pixels.data, canvas.width, canvas.height, keyColor)
+  const effectiveKeyColor = keyColor || detectKeyColorFromPixels(pixels.data, canvas.width, canvas.height)
+  removeKeyedBackgroundFromPixels(pixels.data, canvas.width, canvas.height, effectiveKeyColor)
   ctx.putImageData(pixels, 0, 0)
   return canvas.toDataURL('image/png')
+}
+
+export function detectKeyColorFromPixels(data: Uint8ClampedArray, width: number, height: number): string {
+  // Sample border pixels (top/bottom rows, left/right columns)
+  const borderIndices: number[] = []
+  for (let x = 0; x < width; x += 1) {
+    borderIndices.push(x) // top row
+    borderIndices.push((height - 1) * width + x) // bottom row
+  }
+  for (let y = 1; y < height - 1; y += 1) {
+    borderIndices.push(y * width) // left column
+    borderIndices.push(y * width + width - 1) // right column
+  }
+
+  let greenScore = 0
+  let magentaScore = 0
+  const greenRgb = KEY_COLOR_RGB[GREEN_KEY_COLOR]
+  const magentaRgb = KEY_COLOR_RGB[MAGENTA_KEY_COLOR]
+
+  for (const index of borderIndices) {
+    const offset = index * 4
+    const r = data[offset]
+    const g = data[offset + 1]
+    const b = data[offset + 2]
+
+    const greenDist = Math.sqrt((r - greenRgb.r) ** 2 + (g - greenRgb.g) ** 2 + (b - greenRgb.b) ** 2)
+    const magentaDist = Math.sqrt((r - magentaRgb.r) ** 2 + (g - magentaRgb.g) ** 2 + (b - magentaRgb.b) ** 2)
+
+    if (greenDist < 100) greenScore += 1
+    if (magentaDist < 100) magentaScore += 1
+  }
+
+  return magentaScore > greenScore ? MAGENTA_KEY_COLOR : GREEN_KEY_COLOR
 }
 
 export function removeKeyedBackgroundFromPixels(
@@ -73,7 +97,7 @@ export function removeKeyedBackgroundFromPixels(
   height: number,
   keyColor: string,
 ) {
-  if (data.length < width * height * 4) throw new Error('透明 PNG 像素数据尺寸不匹配')
+  if (data.length < width * height * 4) throw new Error('透明背景像素数据尺寸不匹配')
   const keyRgb = getKeyColorRgb(keyColor)
   const mask = buildBackgroundMask(data, width, height, keyRgb)
   writeTransparentPixels(data, mask, width, height, keyRgb)
@@ -358,7 +382,7 @@ function removeColorSpill(
 
 function getKeyColorRgb(keyColor: string): Rgb {
   const rgb = KEY_COLOR_RGB[keyColor.toUpperCase() as keyof typeof KEY_COLOR_RGB]
-  if (!rgb) throw new Error('透明 PNG 键色不支持')
+  if (!rgb) throw new Error('透明背景键色不支持')
   return rgb
 }
 

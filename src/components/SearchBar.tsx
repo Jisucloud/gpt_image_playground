@@ -1,8 +1,11 @@
+import { useEffect, useRef } from 'react'
 import { useStore } from '../store'
 import Select from './Select'
 import { ChevronLeftIcon, FavoriteIcon, CollectionManageIcon } from './icons'
 
 export default function SearchBar() {
+  const rootRef = useRef<HTMLDivElement>(null)
+  const inputRef = useRef<HTMLInputElement>(null)
   const searchQuery = useStore((s) => s.searchQuery)
   const setSearchQuery = useStore((s) => s.setSearchQuery)
   const filterStatus = useStore((s) => s.filterStatus)
@@ -14,6 +17,23 @@ export default function SearchBar() {
   const openManageCollectionsModal = useStore((s) => s.openManageCollectionsModal)
   const inCollectionOverview = filterFavorite && !activeFavoriteCollectionId
 
+  useEffect(() => {
+    const handleDocumentMouseDown = (event: MouseEvent) => {
+      if (document.activeElement !== inputRef.current) return
+
+      const target = event.target instanceof Element ? event.target : document.elementFromPoint(event.clientX, event.clientY)
+      if (!target) return
+      if (rootRef.current?.contains(target)) return
+      if (!target.closest('[data-drag-select-surface]')) return
+      if (target.closest('.task-card-wrapper, .favorite-collection-card-wrapper')) return
+
+      inputRef.current?.blur()
+    }
+
+    document.addEventListener('mousedown', handleDocumentMouseDown, true)
+    return () => document.removeEventListener('mousedown', handleDocumentMouseDown, true)
+  }, [])
+
   const handleFavoriteClick = () => {
     if (activeFavoriteCollectionId) {
       setActiveFavoriteCollectionId(null)
@@ -23,7 +43,7 @@ export default function SearchBar() {
   }
 
   return (
-    <div data-no-drag-select className="mt-6 mb-4 flex gap-3">
+    <div ref={rootRef} data-no-drag-select className="mt-6 mb-4 flex gap-3">
       <div className="flex gap-2 flex-shrink-0 z-20">
         <button
           onClick={handleFavoriteClick}
@@ -76,6 +96,7 @@ export default function SearchBar() {
           />
         </svg>
         <input
+          ref={inputRef}
           value={searchQuery}
           onChange={(e) => setSearchQuery(e.target.value)}
           type="text"

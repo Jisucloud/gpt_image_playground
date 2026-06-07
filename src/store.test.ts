@@ -75,12 +75,20 @@ vi.mock('./lib/api', () => ({
     revisedPrompts: [],
   })),
 }))
+vi.mock('./lib/falAiImageApi', () => ({
+  getFalErrorMessage: vi.fn((err: unknown) => err instanceof Error ? err.message : String(err)),
+  getFalQueuedImageResult: vi.fn(async () => ({
+    images: [],
+    actualParams: {},
+    actualParamsList: [],
+    revisedPrompts: [],
+  })),
+}))
 vi.mock('./lib/transparentImage', () => ({
   GREEN_KEY_COLOR: '#00FF00',
   MAGENTA_KEY_COLOR: '#FF00FF',
   createTransparentOutputMeta: vi.fn((prompt: string) => ({
     transparentOutput: true,
-    transparentKeyColor: '#00FF00',
     effectivePrompt: `transparent:${prompt}`,
   })),
   getTransparentRequestParams: vi.fn((params: typeof DEFAULT_PARAMS) => ({
@@ -89,7 +97,7 @@ vi.mock('./lib/transparentImage', () => ({
     output_compression: null,
     transparent_output: true,
   })),
-  removeKeyedBackgroundFromDataUrl: vi.fn(async (dataUrl: string, keyColor: string) => `transparent:${keyColor}:${dataUrl}`),
+  removeKeyedBackgroundFromDataUrl: vi.fn(async (dataUrl: string) => `transparent:${dataUrl}`),
 }))
 vi.mock('./lib/agentApi', () => ({
   callAgentConversationTitleApi: vi.fn(async () => '标题'),
@@ -113,6 +121,7 @@ vi.mock('./lib/agentApi', () => ({
 }))
 import { clearAgentConversations, clearImages, clearTasks, getAllAgentConversations, getAllTasks, getImage, putAgentConversation, putImage, putTask as putDbTask } from './lib/db'
 import { callAgentResponsesApi, callBatchImageSingle } from './lib/agentApi'
+import { getFalQueuedImageResult } from './lib/falAiImageApi'
 import { removeKeyedBackgroundFromDataUrl } from './lib/transparentImage'
 import { cleanStaleAgentInputDrafts, deleteAgentRoundFromConversation, deleteFavoriteCollection, editOutputs, getActiveAgentRounds, getErrorToastMessage, getPersistedState, getTaskApiProfile, importData, initStore, markInterruptedOpenAIRunningTasks, migratePersistedState, regenerateAgentAssistantMessage, remapAgentRoundMentionsForPathChange, removeTask, reuseConfig, submitAgentMessage, submitTask, useStore } from './store'
 
@@ -278,8 +287,10 @@ describe('mask draft lifecycle in store actions', () => {
     expect(state.showToast).toHaveBeenCalledWith('任务已提交', 'success')
   })
 
-  it('stores transparent PNG output after local post-processing', async () => {
+  it('stores transparent background output after local post-processing', async () => {
     const { callImageApi } = await import('./lib/api')
+    vi.mocked(callImageApi).mockClear()
+    vi.mocked(removeKeyedBackgroundFromDataUrl).mockClear()
     vi.mocked(callImageApi).mockResolvedValueOnce({
       images: ['data:image/png;base64,generated'],
       actualParams: { output_format: 'png' },
@@ -287,11 +298,11 @@ describe('mask draft lifecycle in store actions', () => {
       revisedPrompts: [],
     })
     useStore.setState({
-      prompt: '红色贴纸',
+      prompt: '单主体贴纸素材',
       params: {
         ...DEFAULT_PARAMS,
-        output_format: 'jpeg',
-        output_compression: 80,
+        output_format: 'png',
+        output_compression: null,
         transparent_output: true,
       },
     })
@@ -302,24 +313,111 @@ describe('mask draft lifecycle in store actions', () => {
     }
 
     expect(callImageApi).toHaveBeenCalledWith(expect.objectContaining({
-      prompt: 'transparent:红色贴纸',
+      prompt: 'transparent:单主体贴纸素材',
       params: expect.objectContaining({
         output_format: 'png',
         output_compression: null,
         transparent_output: true,
       }),
     }))
-    expect(removeKeyedBackgroundFromDataUrl).toHaveBeenCalledWith('data:image/png;base64,generated', '#00FF00')
+    expect(removeKeyedBackgroundFromDataUrl).toHaveBeenCalledWith('data:image/png;base64,generated')
     const [task] = useStore.getState().tasks
     expect(task).toMatchObject({
-      prompt: '红色贴纸',
+      prompt: '单主体贴纸素材',
       transparentOutput: true,
-      transparentKeyColor: '#00FF00',
-      transparentPrompt: 'transparent:红色贴纸',
+      transparentPrompt: 'transparent:单主体贴纸素材',
       status: 'done',
     })
+    expect(task.transparentOriginalImages).toHaveLength(1)
     const outputImage = await getImage(task.outputImages[0])
-    expect(outputImage?.dataUrl).toBe('transparent:#00FF00:data:image/png;base64,generated')
+    const originalImage = await getImage(task.transparentOriginalImages![0])
+    expect(outputImage?.dataUrl).toBe('transparent:data:image/png;base64,generated')
+    expect(originalImage?.dataUrl).toBe('data:image/png;base64,generated')
+    await clearTasks()
+    await clearImages()
+  })
+
+  it('falls back to the original output when transparent post-processing fails', async () => {
+    const { callImageApi } = await import('./lib/api')
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    vi.mocked(callImageApi).mockClear()
+    vi.mocked(removeKeyedBackgroundFromDataUrl).mockClear()
+    vi.mocked(removeKeyedBackgroundFromDataUrl).mockRejectedValueOnce(new Error('post-process failed'))
+    vi.mocked(callImageApi).mockResolvedValueOnce({
+      images: ['data:image/png;base64,generated'],
+      actualParams: { output_format: 'png' },
+      actualParamsList: [{ output_format: 'png' }],
+      revisedPrompts: [],
+    })
+    useStore.setState({
+      prompt: '单主体贴纸素材',
+      params: {
+        ...DEFAULT_PARAMS,
+        output_format: 'png',
+        output_compression: null,
+        transparent_output: true,
+      },
+    })
+
+    await submitTask()
+    for (let i = 0; i < 5; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    }
+
+    const [task] = useStore.getState().tasks
+    expect(task).toMatchObject({
+      transparentOutput: true,
+      status: 'done',
+    })
+    expect(task.transparentOriginalImages).toEqual([''])
+    const outputImage = await getImage(task.outputImages[0])
+    expect(outputImage?.dataUrl).toBe('data:image/png;base64,generated')
+    warnSpy.mockRestore()
+    await clearTasks()
+    await clearImages()
+  })
+
+  it('supports transparent background post-processing for fal gallery tasks', async () => {
+    const { callImageApi } = await import('./lib/api')
+    const falProfile = createDefaultFalProfile({ id: 'fal-profile', apiKey: 'fal-key' })
+    vi.mocked(callImageApi).mockClear()
+    vi.mocked(removeKeyedBackgroundFromDataUrl).mockClear()
+    vi.mocked(callImageApi).mockResolvedValueOnce({
+      images: ['data:image/png;base64,fal-generated'],
+      actualParams: { output_format: 'png' },
+      actualParamsList: [{ output_format: 'png' }],
+      revisedPrompts: [],
+    })
+    useStore.setState({
+      settings: normalizeSettings({
+        ...DEFAULT_SETTINGS,
+        profiles: [falProfile],
+        activeProfileId: falProfile.id,
+      }),
+      prompt: '单主体图标素材',
+      params: {
+        ...DEFAULT_PARAMS,
+        output_format: 'png',
+        transparent_output: true,
+      },
+    })
+
+    await submitTask()
+    for (let i = 0; i < 5; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    }
+
+    expect(callImageApi).toHaveBeenCalledWith(expect.objectContaining({
+      params: expect.objectContaining({
+        output_format: 'png',
+        transparent_output: true,
+      }),
+    }))
+    expect(removeKeyedBackgroundFromDataUrl).toHaveBeenCalledWith('data:image/png;base64,fal-generated')
+    const [task] = useStore.getState().tasks
+    expect(task.apiProvider).toBe('fal')
+    expect(task.transparentOutput).toBe(true)
+    expect(task.transparentOriginalImages).toHaveLength(1)
     await clearTasks()
     await clearImages()
   })
@@ -455,8 +553,9 @@ describe('agent conversation persistence', () => {
   it('loads agent conversations from IndexedDB and migrates legacy localStorage conversations', async () => {
     const storedConversation = agentConversation({ id: 'stored-conversation', createdAt: 1, updatedAt: 1 })
     const legacyConversation = agentConversation({ id: 'legacy-conversation', createdAt: 2, updatedAt: 2 })
-    await putAgentConversation(storedConversation)
     useStore.setState({ agentConversations: [legacyConversation], activeAgentConversationId: legacyConversation.id })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    await putAgentConversation(storedConversation)
 
     await initStore()
 
@@ -558,6 +657,77 @@ describe('agent conversation persistence', () => {
     const serializedMigrated = JSON.stringify(migrated)
     expect(serializedMigrated).not.toContain('legacy-base64')
     expect(serializedMigrated).toContain('image_generation_call')
+  })
+})
+
+describe('fal task recovery', () => {
+  beforeEach(async () => {
+    await clearTasks()
+    await clearImages()
+    vi.mocked(getFalQueuedImageResult).mockClear()
+    vi.mocked(removeKeyedBackgroundFromDataUrl).mockClear()
+    const falProfile = createDefaultFalProfile({ id: 'fal-profile', apiKey: 'fal-key' })
+    useStore.setState({
+      settings: normalizeSettings({
+        ...DEFAULT_SETTINGS,
+        profiles: [falProfile],
+        activeProfileId: falProfile.id,
+      }),
+      tasks: [],
+      inputImages: [],
+      galleryInputDraft: null,
+      agentConversations: [],
+      showToast: vi.fn(),
+    })
+  })
+
+  it('applies transparent post-processing when a fal task recovers', async () => {
+    const falTask = task({
+      id: 'fal-transparent-task',
+      apiProvider: 'fal',
+      apiProfileId: 'fal-profile',
+      apiProfileName: 'fal',
+      apiModel: 'fal-model',
+      params: {
+        ...DEFAULT_PARAMS,
+        output_format: 'png',
+        transparent_output: true,
+      },
+      transparentOutput: true,
+      transparentPrompt: 'transparent:prompt',
+      status: 'error',
+      error: '连接已断开，等待自动恢复',
+      falRequestId: 'fal-request-id',
+      falEndpoint: 'fal-endpoint',
+      falRecoverable: true,
+      finishedAt: null,
+      elapsed: null,
+    })
+    await putDbTask(falTask)
+    vi.mocked(getFalQueuedImageResult).mockResolvedValueOnce({
+      images: ['data:image/png;base64,fal-recovered'],
+      actualParams: { output_format: 'png' },
+      actualParamsList: [{ output_format: 'png' }],
+      revisedPrompts: [],
+    })
+
+    await initStore()
+    for (let i = 0; i < 5; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    }
+
+    expect(removeKeyedBackgroundFromDataUrl).toHaveBeenCalledWith('data:image/png;base64,fal-recovered')
+    const recovered = useStore.getState().tasks.find((item) => item.id === falTask.id)
+    expect(recovered).toMatchObject({
+      status: 'done',
+      falRecoverable: false,
+      transparentOutput: true,
+    })
+    expect(recovered?.transparentOriginalImages).toHaveLength(1)
+    const outputImage = await getImage(recovered!.outputImages[0])
+    const originalImage = await getImage(recovered!.transparentOriginalImages![0])
+    expect(outputImage?.dataUrl).toBe('transparent:data:image/png;base64,fal-recovered')
+    expect(originalImage?.dataUrl).toBe('data:image/png;base64,fal-recovered')
   })
 })
 

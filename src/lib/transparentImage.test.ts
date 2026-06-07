@@ -4,29 +4,20 @@ import {
   GREEN_KEY_COLOR,
   MAGENTA_KEY_COLOR,
   buildTransparentPrompt,
-  createTransparentOutputMeta,
+  detectKeyColorFromPixels,
   getTransparentRequestParams,
-  pickTransparentKeyColor,
   removeKeyedBackgroundFromPixels,
 } from './transparentImage'
 
 describe('transparent image prompt and params', () => {
-  it('uses green key color for ordinary prompts', () => {
-    expect(pickTransparentKeyColor('红色马克杯，产品图')).toBe(GREEN_KEY_COLOR)
-  })
+  it('builds a transparent workflow prompt mentioning both candidate colors', () => {
+    const prompt = buildTransparentPrompt('单主体贴纸素材')
 
-  it('uses magenta key color when the subject likely contains green', () => {
-    expect(pickTransparentKeyColor('绿色树叶游戏图标')).toBe(MAGENTA_KEY_COLOR)
-    expect(pickTransparentKeyColor('a mint green sticker')).toBe(MAGENTA_KEY_COLOR)
-  })
-
-  it('builds a fixed transparent workflow prompt', () => {
-    const prompt = buildTransparentPrompt('一只红色机器人', GREEN_KEY_COLOR)
-
-    expect(prompt).toContain('一只红色机器人')
-    expect(prompt).toContain(GREEN_KEY_COLOR)
-    expect(prompt).toContain('纯色')
-    expect(prompt).toContain('不要把背景色用于主体')
+    expect(prompt).toContain('单主体贴纸素材')
+    expect(prompt).toContain('#00FF00')
+    expect(prompt).toContain('#FF00FF')
+    expect(prompt).toContain('纯色填充')
+    expect(prompt).toContain('禁止')
   })
 
   it('forces transparent requests to PNG without mutating the original params', () => {
@@ -46,13 +37,27 @@ describe('transparent image prompt and params', () => {
     expect(params.output_format).toBe('jpeg')
     expect(params.output_compression).toBe(80)
   })
+})
 
-  it('creates task metadata with the effective prompt and key color', () => {
-    const meta = createTransparentOutputMeta('绿色产品贴纸')
+describe('key color auto-detection', () => {
+  it('detects green key color from border pixels', () => {
+    const pixels = createImagePixels(5, 5, [0, 255, 0, 255])
+    setPixel(pixels, 2, 2, 5, [180, 20, 20, 255]) // foreground center
 
-    expect(meta.transparentOutput).toBe(true)
-    expect(meta.transparentKeyColor).toBe(MAGENTA_KEY_COLOR)
-    expect(meta.effectivePrompt).toContain(MAGENTA_KEY_COLOR)
+    expect(detectKeyColorFromPixels(pixels, 5, 5)).toBe(GREEN_KEY_COLOR)
+  })
+
+  it('detects magenta key color from border pixels', () => {
+    const pixels = createImagePixels(5, 5, [255, 0, 255, 255])
+    setPixel(pixels, 2, 2, 5, [20, 190, 60, 255]) // green foreground center
+
+    expect(detectKeyColorFromPixels(pixels, 5, 5)).toBe(MAGENTA_KEY_COLOR)
+  })
+
+  it('defaults to green when border has no clear key color', () => {
+    const pixels = createImagePixels(5, 5, [128, 128, 128, 255])
+
+    expect(detectKeyColorFromPixels(pixels, 5, 5)).toBe(GREEN_KEY_COLOR)
   })
 })
 
