@@ -45,7 +45,8 @@ import {
 } from './lib/db'
 import { callImageApi } from './lib/api'
 import { callAgentConversationTitleApi, callAgentResponsesApi, callBatchImageSingle, parseBatchImageCallArguments, type AgentApiResultImage } from './lib/agentApi'
-import { collectAgentRoundOutputImageSlots, extractAgentReferenceIds, getAgentCurrentReferenceId, getAgentGeneratedImageReferenceId, replaceAgentPromptImageReferencesForApi } from './lib/agentImageReferences'
+import { buildAgentApiInput, buildAgentContinuationInput } from './lib/agentInputBuilder'
+import { collectAgentRoundOutputImageSlots, extractAgentReferenceIds, getAgentCurrentReferenceId, getAgentGeneratedImageReferenceId } from './lib/agentImageReferences'
 import { showBrowserNotification } from './lib/browserNotification'
 import { IMAGE_FETCH_CORS_HINT } from './lib/imageApiShared'
 import { getFalErrorMessage, getFalQueuedImageResult } from './lib/falAiImageApi'
@@ -60,7 +61,7 @@ import { hasActiveDataOperations } from './lib/dataOperations'
 import { formatExportFileTime } from './lib/exportFileName'
 import { buildExportZip, createExportBlob, getExportImageEstimatedBytes, getExportZipPlan, MAX_EXPORT_ZIP_BYTES, readExportZip, readExportZipFileAsDataUrl, readExportZipManifest } from './lib/exportZip'
 import { deleteAgentRoundFromConversation, getActiveAgentRounds, getAgentRoundPath, normalizeAgentConversations, remapAgentRoundMentionsForPathChange, uniqueIds } from './lib/agentConversationState'
-import { canonicalizeBatchFunctionCallArguments, countResponseToolCalls, createReadyAgentRecoveredToolState, getAgentFunctionOutputCallIds, getAgentRecoveredFailureError, getAgentRecoveredToolCallCount, getAgentRoundResponseOutput, getPersistableAgentConversations, getPersistableRawResponsePayload, mergeResponseOutputItems, sanitizeResponseOutputForInput, scrubResponseOutputForDeletedAgentTasks, scrubTaskRawResponsePayloadForDeletedTasks, stripPersistedAgentConversations } from './lib/agentResponseState'
+import { canonicalizeBatchFunctionCallArguments, countResponseToolCalls, createReadyAgentRecoveredToolState, getAgentFunctionOutputCallIds, getAgentRecoveredFailureError, getAgentRecoveredToolCallCount, getPersistableAgentConversations, getPersistableRawResponsePayload, mergeResponseOutputItems, scrubResponseOutputForDeletedAgentTasks, scrubTaskRawResponsePayloadForDeletedTasks, stripPersistedAgentConversations } from './lib/agentResponseState'
 import { cleanStaleAgentInputDrafts, clearInputDraftState, getPersistableAgentInputDrafts, isEmptyAgentInputDraft, normalizeAgentInputDraft, normalizeAgentInputDrafts, normalizeAgentInputDraftsByKey, remapAgentInputDraftMentionsForPathChange, restoreAgentInputDraftState, restoreGalleryInputDraftState, saveActiveAgentInputDrafts, saveGalleryInputDraft, syncActiveInputDraft, updateInputDraftImages } from './lib/inputDraftState'
 import { ALL_FAVORITES_COLLECTION_ID, DEFAULT_FAVORITE_COLLECTION_ID, createDefaultFavoriteCollection, deleteFavoriteCollectionState, ensureDefaultFavoriteCollection, getTaskFavoriteCollectionIds, mergeFavoriteCollections, normalizeFavoriteCollectionIds, normalizeFavoriteCollectionName, normalizeFavoriteCollections, normalizeFavoritePatch, normalizeLoadedFavoriteState, resolveDefaultFavoriteCollectionId, sameFavoriteCollectionIds } from './lib/favoriteState'
 
@@ -2216,97 +2217,6 @@ async function readAgentImageDataUrls(ids: string[]) {
   return dataUrls
 }
 
-async function createAgentUserInputItem(conversation: AgentConversation, round: AgentRound, message: AgentMessage, tasks: TaskRecord[]) {
-  const imageDataUrls = await readAgentImageDataUrls(round.inputImageIds)
-  const rounds = getAgentRoundPath(conversation, round.id)
-  const text = replaceAgentPromptImageReferencesForApi(message.content, round, rounds, tasks)
-  const referenceText = round.inputImageIds.length > 0
-    ? `\n\n<available_refs>${round.inputImageIds.map((_, index) => `\n  <ref id="${getAgentCurrentReferenceId(round, index)}" />`).join('')}\n</available_refs>`
-    : ''
-  return {
-    role: 'user',
-    content: [
-      { type: 'input_text', text: `${text}${referenceText}` },
-      ...imageDataUrls.map((dataUrl) => ({ type: 'input_image', image_url: dataUrl })),
-    ],
-  }
-}
-
-async function createAgentGeneratedImagesInputItem(round: AgentRound, tasks: TaskRecord[]) {
-  const contentParts: Array<{ type: string; text?: string; image_url?: string }> = []
-  let imageIndex = 0
-  for (const taskId of round.outputTaskIds) {
-    const task = tasks.find((item) => item.id === taskId)
-    if (!task) {
-      contentParts.push({ type: 'input_text', text: `<removed_ref id="${getAgentGeneratedImageReferenceId(round, imageIndex)}" />` })
-      imageIndex += 1
-      continue
-    }
-    for (const imageId of task.outputImages) {
-      const dataUrl = await ensureImageCached(imageId)
-      if (dataUrl) {
-        contentParts.push({ type: 'input_image', image_url: dataUrl })
-      }
-      const refId = getAgentGeneratedImageReferenceId(round, imageIndex)
-      const prompt = truncateAgentReferencePrompt(task.prompt || '')
-      const promptAttribute = prompt ? ` prompt="${escapeXmlAttribute(prompt)}"` : ''
-      contentParts.push({ type: 'input_text', text: `<ref id="${refId}"${promptAttribute} />` })
-      imageIndex += 1
-    }
-  }
-  if (contentParts.length === 0) return null
-  return { role: 'user', content: contentParts }
-}
-
-async function createAgentBatchImagesInputItem(round: AgentRound, tasks: TaskRecord[], batchTaskIds: string[]) {
-  const contentParts: Array<{ type: string; text?: string; image_url?: string }> = []
-  // Count existing images in the round to compute correct imageIndex offset
-  let baseImageIndex = 0
-  for (const taskId of round.outputTaskIds) {
-    if (batchTaskIds.includes(taskId)) break
-    const task = tasks.find((item) => item.id === taskId)
-    baseImageIndex += task ? task.outputImages.length : 1
-  }
-  let imageIndex = baseImageIndex
-  for (const taskId of batchTaskIds) {
-    const task = tasks.find((item) => item.id === taskId)
-    if (!task || task.status !== 'done') continue
-    for (const imgId of task.outputImages) {
-      const dataUrl = await ensureImageCached(imgId)
-      if (dataUrl) {
-        contentParts.push({ type: 'input_image', image_url: dataUrl })
-      }
-      const refId = getAgentGeneratedImageReferenceId(round, imageIndex)
-      const prompt = truncateAgentReferencePrompt(task.prompt || '')
-      const promptAttribute = prompt ? ` prompt="${escapeXmlAttribute(prompt)}"` : ''
-      contentParts.push({ type: 'input_text', text: `<ref id="${refId}"${promptAttribute} />` })
-      imageIndex += 1
-    }
-  }
-  if (contentParts.length === 0) return null
-  return { role: 'user', content: contentParts }
-}
-
-function escapeXmlAttribute(value: string) {
-  return value
-    .replace(/&/g, '&amp;')
-    .replace(/"/g, '&quot;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-}
-
-function truncateAgentReferencePrompt(prompt: string) {
-  const normalized = prompt.replace(/\s+/g, ' ').trim()
-  return normalized.length > 1200 ? `${normalized.slice(0, 1200)}...` : normalized
-}
-
-function createAgentAssistantFallbackItem(text: string) {
-  return {
-    role: 'assistant',
-    content: [{ type: 'output_text', text }],
-  }
-}
-
 function scrubAgentOutputPayloadsForDeletedTasks(deletedTasks: TaskRecord[]) {
   const deletedByRound = new Map<string, TaskRecord[]>()
   const affectedConversationIds = new Set<string>()
@@ -2384,82 +2294,6 @@ async function persistTaskDeletionCleanup(deletedTaskIds: string[], cleanup: Ret
       ...conversations.map((conversation) => dbPutAgentConversation(conversation)),
     ])
   }
-}
-
-function createAgentContinuationInputItem(newImageRefs: string[], toolCallsUsed: number, maxToolCalls: number) {
-  const lines = [
-    '[System] The app has saved your generated outputs and is continuing the same Agent turn.',
-  ]
-  if (newImageRefs.length > 0) {
-    lines.push(
-      `The following image ref ids are now available for you to reference in subsequent image_generation prompts: ${newImageRefs.join(', ')}`,
-    )
-  }
-  lines.push(
-    'Continue generating. Do NOT repeat what you already said in earlier responses.',
-    'If you still need another round after this (e.g. more dependent images), call continue_generation.',
-    `Tool-call budget: ${toolCallsUsed}/${maxToolCalls} used.`,
-  )
-  return {
-    role: 'user',
-    content: [{
-      type: 'input_text',
-      text: lines.join('\n'),
-    }],
-  }
-}
-
-function buildAgentContinuationInput(baseInput: unknown[], round: AgentRound, tasks: TaskRecord[], currentRoundOutput: ResponsesOutputItem[], toolCallsUsed: number, maxToolCalls: number) {
-  const input = [...baseInput, ...sanitizeResponseOutputForInput(currentRoundOutput, { allowPendingFunctionCalls: true })]
-  const newImageRefs = collectAgentRoundOutputImageSlots(round, tasks)
-    .map((imageId, index) => imageId ? `<ref id="${getAgentGeneratedImageReferenceId(round, index)}" />` : null)
-    .filter((ref): ref is string => Boolean(ref))
-  input.push(createAgentContinuationInputItem(newImageRefs, toolCallsUsed, maxToolCalls))
-  return input
-}
-
-async function buildAgentApiInput(conversation: AgentConversation, currentRound: AgentRound, tasks: TaskRecord[]): Promise<unknown[]> {
-  const input: unknown[] = []
-  const rounds = getAgentRoundPath(conversation, currentRound.id)
-
-  for (const round of rounds) {
-    const userMessage = conversation.messages.find((message) => message.id === round.userMessageId)
-    if (!userMessage) continue
-
-    input.push(await createAgentUserInputItem(conversation, round, userMessage, tasks))
-    if (round.id === currentRound.id) continue
-
-    const output = getAgentRoundResponseOutput(round, tasks)
-    if (output?.length) {
-      const sanitizedOutput = sanitizeResponseOutputForInput(output)
-      if (sanitizedOutput.length > 0) {
-        input.push(...sanitizedOutput)
-      } else {
-        // All output items were filtered (e.g. only image_generation_call); add fallback
-        const assistantMessage = round.assistantMessageId
-          ? conversation.messages.find((message) => message.id === round.assistantMessageId)
-          : null
-        input.push(createAgentAssistantFallbackItem(
-          assistantMessage?.content || '图像已生成。',
-        ))
-      }
-    } else {
-      const assistantMessage = round.assistantMessageId
-        ? conversation.messages.find((message) => message.id === round.assistantMessageId)
-        : null
-      input.push(createAgentAssistantFallbackItem(
-        assistantMessage?.content || '[No text response]',
-      ))
-    }
-
-    // Inject generated images as a separate user message with input_image parts
-    if (round.outputTaskIds.length > 0) {
-      const imagesItem = await createAgentGeneratedImagesInputItem(round, tasks)
-      if (imagesItem) input.push(imagesItem)
-    }
-  }
-
-  return input
 }
 
 function appendAgentRecoveredToolOutputs(conversationId: string, roundId: string, additions: ResponsesOutputItem[]) {
@@ -2847,7 +2681,12 @@ async function executeAgentRound(
     const maskDataUrl = round.maskImageId ? await ensureImageCached(round.maskImageId) : undefined
     if (round.maskImageId && !maskDataUrl) throw new Error('遮罩图片已不存在')
 
-    const apiInput = await buildAgentApiInput(conversation, round, latestState.tasks)
+    const apiInput = await buildAgentApiInput({
+      conversation,
+      currentRound: round,
+      tasks: latestState.tasks,
+      loadImage: ensureImageCached,
+    })
     if (controller.signal.aborted) throw createAgentAbortError()
     const existingAssistantMessage = round.assistantMessageId
       ? conversation.messages.find((message) => message.id === round.assistantMessageId) ?? null
@@ -3068,9 +2907,17 @@ async function executeAgentRound(
     let toolCallsUsed = resume?.toolCallsUsed ?? 0
     let apiInputForTurn = apiInput
     if (resume) {
-      apiInputForTurn = buildAgentContinuationInput(apiInput, round, useStore.getState().tasks, accumulatedOutputItems, toolCallsUsed, maxToolCalls)
-      const batchImagesItem = await createAgentBatchImagesInputItem(round, useStore.getState().tasks, resume.recoveredTaskIds)
-      if (batchImagesItem) apiInputForTurn.splice(apiInputForTurn.length - 1, 0, batchImagesItem)
+      const resumeState = useStore.getState()
+      apiInputForTurn = await buildAgentContinuationInput({
+        baseInput: apiInput,
+        currentRound: round,
+        tasks: resumeState.tasks,
+        currentRoundOutput: accumulatedOutputItems,
+        batchTaskIds: resume.recoveredTaskIds,
+        toolCallsUsed,
+        maxToolCalls,
+        loadImage: ensureImageCached,
+      })
     }
     let reachedToolLimit = resume ? toolCallsUsed >= maxToolCalls : false
     let pendingToolTextSeparator = false
@@ -3633,27 +3480,22 @@ async function executeAgentRound(
       }
 
       // Build continuation input with function call outputs and available refs
-      const latestConversation = useStore.getState().agentConversations.find((item) => item.id === conversationId)
+      const continuationState = useStore.getState()
+      const latestConversation = continuationState.agentConversations.find((item) => item.id === conversationId)
       const latestRound = latestConversation?.rounds.find((item) => item.id === roundId)
       if (!latestRound) break
-      const continuationOutputItems = accumulatedOutputItemsWithFunctionOutputs.filter(
-        (item) => item.type !== 'function_call_output' || !item.call_id || !generatedOutputCallIds.has(item.call_id),
-      )
 
-      const continuationBase = buildAgentContinuationInput(
-        apiInput,
-        latestRound,
-        useStore.getState().tasks,
-        continuationOutputItems,
+      apiInputForTurn = await buildAgentContinuationInput({
+        baseInput: apiInput,
+        currentRound: latestRound,
+        tasks: continuationState.tasks,
+        currentRoundOutput: accumulatedOutputItemsWithFunctionOutputs,
+        functionCallOutputs: effectiveFunctionCallOutputs,
+        batchTaskIds: streamingTaskIds,
         toolCallsUsed,
         maxToolCalls,
-      )
-      // Insert function_call_output items before the continuation system message
-      continuationBase.splice(continuationBase.length - 1, 0, ...effectiveFunctionCallOutputs)
-      // Inject batch-generated images as input_image user message for model visibility
-      const batchImagesItem = await createAgentBatchImagesInputItem(latestRound, useStore.getState().tasks, streamingTaskIds)
-      if (batchImagesItem) continuationBase.splice(continuationBase.length - 1, 0, batchImagesItem)
-      apiInputForTurn = continuationBase
+        loadImage: ensureImageCached,
+      })
       accumulatedOutputItems = accumulatedOutputItemsWithFunctionOutputs
       pendingToolTextSeparator = true
     }
